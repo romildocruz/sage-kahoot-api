@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.idea/
+.git/
+.github/
+openspec/
+docs/
+deploy/
+
+# Projetos de teste vivem sob src/, mas não entram na imagem.
+src/Sage.Kahoot.UnitTests/
+src/Sage.Kahoot.IntegrationTests/
+**/*.user
+**/appsettings.Local.json
+README*.md

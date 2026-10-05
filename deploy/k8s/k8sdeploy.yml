@@ -1,0 +1,167 @@
+# =============================================================================
+# sage-kahoot-api — manifests de deploy no cluster interno
+#
+# Aplicar:
+#   kubectl -n {{NAMESPACE_K8S}} apply -f deploy/k8s/k8sdeploy.yml
+#
+# PRÉ-REQUISITO — criar o Secret ANTES de aplicar este arquivo. Ele não está
+# incluído aqui de propósito: um Secret com placeholders neste arquivo faria
+# cada `kubectl apply` sobrescrever as credenciais reais por "PLACEHOLDER".
+#
+#   kubectl -n {{NAMESPACE_K8S}} create secret generic sage-kahoot-api-secret \
+#     --from-literal=Mongo__ConnectionString='mongodb://<host>:27017' \
+#     --from-literal=Auth__AdminUsername='<usuario>' \
+#     --from-literal=Auth__AdminPassword='<senha>' \
+#     --from-literal=Auth__SigningKey='<chave com no minimo 32 bytes>'
+#
+# PENDENTE — confirmar com a infraestrutura antes do primeiro deploy:
+#   classe do Ingress, anotações obrigatórias e TLS interno
+#   (design.md, Open Questions 2 e 3).
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sage-kahoot-api-config
+  namespace: "{{NAMESPACE_K8S}}"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-api
+    app.kubernetes.io/part-of: sage-kahoot
+data:
+  ASPNETCORE_ENVIRONMENT: "Production"
+  Mongo__Database: "sage_kahoot"
+  Mongo__HealthCheckTimeoutMs: "2000"
+  # Origem interna do sage-kahoot-web. Curinga é recusado na inicialização da aplicação.
+  Cors__AllowedOrigins__0: "https://sage-kahoot.{{DOMINIO_INTERNO}}"
+  Session__MaxParticipants: "100"
+  Session__AnswerToleranceMs: "500"
+  Session__AbandonedAfterHours: "4"
+  RateLimiting__LoginPermitLimit: "5"
+  RateLimiting__LoginWindowSeconds: "60"
+  RateLimiting__JoinPermitLimit: "20"
+  RateLimiting__JoinWindowSeconds: "60"
+  # Decisão pendente do time (design.md, Open Questions 4). Padrão: desabilitado.
+  Swagger__Enabled: "false"
+  Seed__Enabled: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sage-kahoot-api
+  namespace: "{{NAMESPACE_K8S}}"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-api
+    app.kubernetes.io/part-of: sage-kahoot
+spec:
+  # Obrigatoriamente 1: o SignalR roda sem backplane, então duas instâncias quebrariam
+  # a entrega de eventos das sessões ao vivo.
+  replicas: 1
+  strategy:
+    # Recreate, e não RollingUpdate, para nunca haver duas instâncias simultâneas.
+    # Consequência assumida: o deploy derruba sessões em andamento — fazer fora do
+    # horário de treinamento.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sage-kahoot-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sage-kahoot-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: "{{REGISTRY_IMAGENS}}/sage-kahoot-api:latest"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: sage-kahoot-api-config
+            - secretRef:
+                name: sage-kahoot-api-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            # Fica negativa enquanto o MongoDB estiver inacessível ou os índices não
+            # tiverem sido criados; o pod não recebe tráfego até lá.
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Dimensionamento modesto: dezenas de participantes por sessão, não milhares.
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem exige um destino gravável para arquivos temporários.
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sage-kahoot-api
+  namespace: "{{NAMESPACE_K8S}}"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-api
+spec:
+  # ClusterIP: sem exposição pública. O acesso vem do Ingress interno ou de port-forward.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sage-kahoot-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sage-kahoot-api
+  namespace: "{{NAMESPACE_K8S}}"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-api
+  annotations:
+    # WebSocket do SignalR precisa de afinidade e de timeout longo no proxy.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+spec:
+  ingressClassName: nginx-internal
+  rules:
+    - host: "sage-kahoot-api.{{DOMINIO_INTERNO}}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sage-kahoot-api
+                port:
+                  name: http

@@ -1,0 +1,29 @@
+# Build
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+*.suo
+
+# Rider / VS / VS Code
+.idea/
+.vs/
+.vscode/
+
+# Test results
+TestResults/
+*.trx
+coverage*.xml
+coverage*.json
+
+# Secrets — nunca versionar valores reais (ver README)
+appsettings.Local.json
+appsettings.*.Local.json
+*.secrets.json
+.env
+deploy/k8s/secret.yml
+deploy/k8s/secret.yaml
+deploy/k8s/*secret*.yml
+!deploy/k8s/secret.example.yml

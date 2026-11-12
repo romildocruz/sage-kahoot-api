@@ -1,0 +1,131 @@
+# =============================================================================
+# sage-kahoot-web — deploy LOCAL (k3s no WSL, ingress Traefik)
+#
+# Gerado a partir do k8sdeploy.yml do sage-kahoot-web. Diferenças em relação ao
+# deploy interno:
+#   - imagem local (docker.io/library/sage-kahoot-web:local), sem registry;
+#   - API_BASE_URL e JOIN_URL_BASE vazios: frontend e API respondem na mesma
+#     origem (ver ingress.yml), então o SPA chama a API por caminho relativo;
+#   - sem Ingress aqui: o roteamento por caminho está em ingress.yml.
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sage-kahoot-web-config
+  namespace: "sage-kahoot"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-web
+    app.kubernetes.io/part-of: sage-kahoot
+data:
+  # Origem da API. Precisa bater com Cors__AllowedOrigins__0 do lado da API — lá a origem
+  # autorizada é a deste frontend; aqui é o destino das chamadas REST e do hub SignalR.
+  API_BASE_URL: ""
+  # Endereço exibido no telão para o participante entrar. Vazio = origem do próprio frontend.
+  JOIN_URL_BASE: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sage-kahoot-web
+  namespace: "sage-kahoot"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-web
+    app.kubernetes.io/part-of: sage-kahoot
+spec:
+  # Conteúdo estático, sem estado: pode escalar horizontalmente a qualquer momento — a restrição de
+  # instância única é da API, que hospeda o hub, não daqui. Fica em 1 porque a escala é modesta
+  # (dezenas de participantes por sessão) e o ambiente de desenvolvimento roda com uma só; subir
+  # para 2 ou mais é decisão de infraestrutura, sem impacto na aplicação.
+  # Mesmo com 1 réplica o rollout não derruba o serviço: o padrão de maxUnavailable (25%) arredonda
+  # para 0 e o de maxSurge arredonda para 1, então o pod novo sobe antes de o antigo sair.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sage-kahoot-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sage-kahoot-web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # Explícito e numérico: é o uid do usuário nginx na imagem base. Sem ele, a verificação de
+        # não-root depende do USER da imagem ser numérico.
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: "docker.io/library/sage-kahoot-web:local"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: sage-kahoot-web-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Servir arquivo estático custa pouco.
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            # Com a raiz somente leitura, o nginx precisa de destinos graváveis: o config.js de
+            # runtime e os temporários vão para /tmp; a conf renderizada do template, para conf.d.
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-conf
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sage-kahoot-web
+  namespace: "sage-kahoot"
+  labels:
+    app.kubernetes.io/name: sage-kahoot-web
+spec:
+  # ClusterIP: sem exposição pública. O acesso vem do Ingress interno ou de port-forward.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sage-kahoot-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
